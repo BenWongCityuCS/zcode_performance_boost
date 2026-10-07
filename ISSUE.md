@@ -34,3 +34,12 @@
 
 - 收敛阈值是常量 `CONVERSATION_WINDOW_MAX_QUERY_TURNS = 10`（`conversationWindowBound.ts`），可按需调整或做成设置项；
 - 语义取舍写在文件头注释：为什么只在真人提问时收敛、为什么按提问数不按行数、为什么恒等稳定。
+## 顺带报告：另一处原生 bug（不在本补丁范围内）
+
+**现象**：流式回答生成期间，点击问题导航里的旧提问刻度，视图会被拉回底部、定位失效；
+此时手动往上滚，滚动位置会被贴底逻辑拽回。非流式期间未复现。
+
+**怀疑点**（供参考）：`ConversationTimeline.tsx` 的 `scrollToQuery` 中
+`target.unitIndex === liveUnitIndex` 时改滚 `liveTail` 的分支，与 `following` 贴底跟随在
+流式期间的交互；以及 `splitConversationTimelineLiveTail` 把 live 尾拆出虚拟列表后，
+`renderUnits` 与 `virtualizedUnits` 两套 unitIndex 坐标系的偏差。

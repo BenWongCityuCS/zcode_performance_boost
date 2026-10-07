@@ -1,0 +1,372 @@
+From 51d4cde07c65cf9b384b2bed2c72dfe8fd61931f Mon Sep 17 00:00:00 2001
+From: Ben Wong <BenWongCityuCS@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 22:20:52 +0800
+Subject: [PATCH] fix(ui): bound renderer conversation window on real-user
+ queries
+
+Long conversations grow rows.window without bound (row.appended appends,
+nothing evicts), and the turn-navigator's wide-screen auto loadAllOlder
+pulls the entire history back in - renderer memory grows with session
+length and the UI lags noticeably on very long turns (reproduced on a
+desktop i5-12400/64GB, ZCode Desktop 3.14.x).
+
+This bounds the CLIENT display window only; the protocol layer
+(apply.ts) and the server projection (rowsRange pagination source) are
+untouched, so full history stays reachable via loadOlder.
+
+- conversationWindowBound.ts (new, pure functions + unit tests):
+  * boundWindowOnRealUserQuery: on a real-user query append, keep the
+    turns of the last 10 real queries in the window (turn-tagged rows
+    stay together; synthetic rows do not trigger trimming; identity
+    stable when nothing is trimmed). Rows leave the window, not the
+    log: canLoadOlder keeps holding and scroll-to-top loadOlder pages
+    them back.
+  * mergeSnapshotTailOntoLocalWindow: snapshots only carry the tail
+    (snapshotTailWindowRows); a mid-long-turn resync used to replace the
+    wholesale window with that tail, wiping earlier queries. When the
+    incoming snapshot is the same logEpoch and a strict append
+    extension, the local prefix rows are kept in front of the tail
+    (guarded by monotonic totalCount/rowId and the snapshot's own
+    earlier-row budget); otherwise the wholesale replace still applies.
+- conversationProjectionStore.ts: apply both at the two frame paths.
+- conversationTurnNavigatorHelpers.ts: navigator ticks are derived from
+  rows.window, so the auto full-history hydration defeats any window
+  bound; it is now gated off (ticks degrade to bookmarks of the loaded
+  window and grow as loadOlder expands history; share-view hydration is
+  a separate path and is unaffected). A future lightweight query
+  directory could restore full tick lists without loading all rows.
+
+Tests: node --test (or tsx) on packages/ui/test/conversationWindowBound.test.ts
+---
+ .../ui/src/v4/conversationProjectionStore.ts  |  35 ++++-
+ .../v4/conversationTurnNavigatorHelpers.ts    |   8 ++
+ packages/ui/src/v4/conversationWindowBound.ts |  81 ++++++++++++
+ .../ui/test/conversationWindowBound.test.ts   | 123 ++++++++++++++++++
+ 4 files changed, 240 insertions(+), 7 deletions(-)
+ create mode 100644 packages/ui/src/v4/conversationWindowBound.ts
+ create mode 100644 packages/ui/test/conversationWindowBound.test.ts
+
+diff --git a/packages/ui/src/v4/conversationProjectionStore.ts b/packages/ui/src/v4/conversationProjectionStore.ts
+index 215a4d3..af6326f 100644
+--- a/packages/ui/src/v4/conversationProjectionStore.ts
++++ b/packages/ui/src/v4/conversationProjectionStore.ts
+@@ -1,7 +1,8 @@
+ /* eslint-disable max-lines -- projection/base/recovery/optimistic 必须共享一个原子 store 状态机，拆分会重新引入跨对象竞态。 */
+ // Per-session projection store（只读 projection store）。
+ // 唯一写入方是订阅推送；UI 只读。客户端遵守三条规则：
+-//   1. snapshot → 整体替换，绝不 merge；
++//   1. snapshot → 整体替换，绝不 merge（唯一例外：同 logEpoch 的守卫式尾拼，见
++//      conversationWindowBound.ts——仍是单次原子落地的全新对象，不涉及逐键合并）；
+ //   2. delta 帧仅在区间衔接（frame.fromSeq === snapshot.seq）时 apply，断档不猜、不缓存补偿；
+ //   3. base 与状态同生共死——断档时状态未被污染，携当前水位重订阅，由服务端裁决 resume/snapshot。
+ // 除 optimistic overlay（pending 命令展示）外，本 store 不产生任何 conversation 事实。
+@@ -20,6 +21,11 @@ import {
+   type TopicFrameDeliveryKind,
+ } from "@zcode/shared/zcode-protocol-v4";
+ import { logger } from "@/logger.js";
++import {
++  boundWindowOnRealUserQuery,
++  isRealUserQueryRow,
++  mergeSnapshotTailOntoLocalWindow,
++} from "@/v4/conversationWindowBound.js";
+ import type { ConversationTurnNavigatorHydrationResult } from "@/v4/conversationTurnNavigatorHelpers.js";
+ import type { ConversationTransport } from "@/v4/transport.js";
+ import { uiMemoryDiagnosticsRegistry } from "@/lib/memoryDiagnostics.js";
+@@ -662,20 +668,27 @@ export class ConversationProjectionStore {
+         frame.payload.snapshot,
+         "snapshot",
+       );
+-      // 规则 1：整体替换，扔掉手里的一切换新的。
++      // 规则 1：整体替换，扔掉手里的一切换新的。唯一例外是守卫式尾拼：快照窗口只有
++      // 尾部 snapshotTailWindowRows 行，单轮长回合的重订阅整替会把早前提问整段冲掉；
++      // 同 logEpoch 且追加性未破坏时把本地窗口更早行拼回前面（纯函数、单次原子落地，
++      // 语义与守卫见 conversationWindowBound.ts）。
++      const mergedSnapshot = mergeSnapshotTailOntoLocalWindow(
++        this.state.snapshot,
++        frame.payload.snapshot,
++      );
+       this.setState({
+-        snapshot: frame.payload.snapshot,
++        snapshot: mergedSnapshot,
+         planDirectoryRevision: this.state.planDirectoryRevision + 1,
+         // snapshot 整体替换后 real-user query 集合可能已变，终态缓存必须失效。
+         turnNavigatorDirectoryRevision: this.state.turnNavigatorDirectoryRevision + 1,
+       });
+       this.subscriptionHasAppliedBase = true;
+-      this.reconcileOptimistic(frame.payload.snapshot);
+-      this.reconcileAcceptedInputProjection(frame.payload.snapshot);
++      this.reconcileOptimistic(mergedSnapshot);
++      this.reconcileAcceptedInputProjection(mergedSnapshot);
+       // initial 丢失时，publisher 允许完整 online snapshot 建立首个
+       // applied base；其中的持久 transition 可能早于本次订阅，不能冒充实时新事件。
+       // 首帧只播种观察基线，后续 online 跃迁才通知 pane。
+-      this.observeModelTransition(frame.payload.snapshot, context.online && hadAppliedBase);
++      this.observeModelTransition(mergedSnapshot, context.online && hadAppliedBase);
+       if (context.subscribeMode !== null && context.frameReceivedAt !== undefined) {
+         const snapshotAppliedAt = monotonicNow();
+         this.sessionOpenRendererTiming = {
+@@ -720,8 +733,16 @@ export class ConversationProjectionStore {
+       return;
+     }
+     const applied = applyConversationDeltas(current, frame.payload.deltas);
++    // 显示窗口收敛：帧里有真人新提问时，把 rows.window 收敛到最近 N 个提问所在的
++    // 回合（conversationWindowBound.ts）。totalCount/firstRowId 不动，继续作
++    // rowsRange 分页锚点描述全序，被收敛的行经 loadOlder 取回。
++    const window = frame.payload.deltas.some(
++      (delta) => delta.op === "row.appended" && isRealUserQueryRow(delta.row),
++    )
++      ? boundWindowOnRealUserQuery(applied.rows.window)
++      : applied.rows.window;
+     // seq 是快照对齐水位，delta 帧应用完推进到帧右端点。
+-    const next = { ...applied, seq: frame.toSeq };
++    const next = { ...applied, rows: { ...applied.rows, window }, seq: frame.toSeq };
+     logSubagentProjectionTransition(this.topic, current, next, "deltas");
+     const removedFromRowId = frame.payload.deltas.reduce<number | null>(
+       (earliest, delta) =>
+diff --git a/packages/ui/src/v4/conversationTurnNavigatorHelpers.ts b/packages/ui/src/v4/conversationTurnNavigatorHelpers.ts
+index 4ddd782..5a40845 100644
+--- a/packages/ui/src/v4/conversationTurnNavigatorHelpers.ts
++++ b/packages/ui/src/v4/conversationTurnNavigatorHelpers.ts
+@@ -67,6 +67,13 @@ interface ResolveConversationTurnNavigatorVisualFocusItemIndexOptions {
+ }
+ 
+ const CONVERSATION_TURN_NAVIGATOR_MIN_WIDTH_PX = 864;
++// 「宽屏自动全量补齐导航目录」的开关。停用原因：导航刻度从 rows.window 实时派生，
++// loadAllOlder 全量补齐会把已收敛的显示窗口（conversationWindowBound.ts）重新拉满，
++// 窗口收敛随即失效——这正是 renderer 内存随会话时长增长的另一半根因。停用后刻度
++// 退化为「已加载窗口内的提问书签」，loadOlder 展开历史时刻度随之变多；分享视图的
++// 目录补齐走独立通道（SessionPane 的 shareActive 分支），不受影响。
++// 后续方向：为导航提供不拉全量行的轻量 query 目录，届时可移除本开关。
++const AUTO_HYDRATE_TURN_NAVIGATOR_DIRECTORY = false;
+ 
+ export type ConversationTurnNavigatorHydrationResult =
+   | { status: "hydrated"; logEpoch: string }
+@@ -80,6 +87,7 @@ export function shouldHydrateConversationTurnNavigatorDirectory(params: {
+   hasLoadHandler: boolean;
+   loadingOlder: boolean;
+ }): boolean {
++  if (!AUTO_HYDRATE_TURN_NAVIGATOR_DIRECTORY) return false;
+   return (
+     params.canLoadOlder &&
+     !params.loadingOlder &&
+diff --git a/packages/ui/src/v4/conversationWindowBound.ts b/packages/ui/src/v4/conversationWindowBound.ts
+new file mode 100644
+index 0000000..476a0f0
+--- /dev/null
++++ b/packages/ui/src/v4/conversationWindowBound.ts
+@@ -0,0 +1,81 @@
++// 会话显示窗口收敛（display-window bounding）。
++//
++// rows.window 在协议层只增不减（apply.ts 的 row.appended 追加后无淘汰），叠加问题导航
++// 宽屏自动 loadAllOlder 全量补齐，渲染进程持有的行随会话时长无限增长；超长会话下界面
++// 明显卡顿（ZCode Desktop 3.14.x 实测，i5-12400/64GB 机器上不打补丁超长对话轮即卡）。
++// 这里收敛的只是**客户端显示窗口**：完整历史仍在服务端 projection（rowsRange 分页随时
++// 取回），协议层 apply.ts 与服务端投影不动。
++//
++// 语义来自一整轮实测迭代（客户端窗口补丁 v1→v3.5）的结论：
++// 1. 只在「真人发新提问」（row.appended 且 kind=userInput/origin=realUser）时收敛。
++//    goalContinuation / backgroundResult / mailbox / synthetic 行同为 kind=userInput，
++//    若一并触发，单轮长回合里每次合成交达都会裁一轮——翻旧账会被反复打断；
++// 2. 按**提问数**留窗口而不是按行数：重工具回合里按行数裁会让窗口只剩 0/1 条提问；
++//    保留「最近 N 个真实提问所在的回合」（turn 是 row 上的标签，按 turnId 过滤即
++//    回合内已加载行整体保留，回合头不丢）；
++// 3. 恒等稳定：什么都没裁掉就还同一个数组引用，避免无谓的下游重渲染。
++//
++// 被收敛的行不是删除：canLoadOlder 判定（window 首行 rowId > firstRowId）继续成立，
++// 滚动到顶的 loadOlder 预取 / 手动加载更早照常把它们经 rowsRange 分页取回。
++import type { ConversationRow, ConversationSnapshot } from "@zcode/shared/zcode-protocol-v4";
++
++/** 窗口保留「最近多少个真实提问所在的回合」。 */
++export const CONVERSATION_WINDOW_MAX_QUERY_TURNS = 10;
++
++/** 真人新提问行：kind=userInput 且 origin=realUser（其余 origin 均为合成行）。 */
++export function isRealUserQueryRow(row: ConversationRow): boolean {
++  return row.kind === "userInput" && row.origin === "realUser";
++}
++
++/**
++ * 在窗口已含新行之后收敛：保留最近 CONVERSATION_WINDOW_MAX_QUERY_TURNS 个真实提问
++ * 所在回合的全部已加载行；什么都没裁掉就原样返回（恒等稳定）。入参不被修改。
++ *
++ * 注意合成回合（无真实提问的 turn）会随收敛一并出窗——它们没有翻阅价值，且
++ * rowsRange 仍可分页取回。
++ */
++export function boundWindowOnRealUserQuery(window: ConversationRow[]): ConversationRow[] {
++  const queries = window.filter(isRealUserQueryRow);
++  if (queries.length <= CONVERSATION_WINDOW_MAX_QUERY_TURNS) return window;
++  const keptTurnIds = new Set(
++    queries.slice(-CONVERSATION_WINDOW_MAX_QUERY_TURNS).map((row) => row.turnId),
++  );
++  const bounded = window.filter((row) => keptTurnIds.has(row.turnId));
++  return bounded.length === window.length ? window : bounded;
++}
++
++/**
++ * 快照尾巴拼接（守卫式尾拼；store 规则 1「整体替换」的唯一例外）。
++ *
++ * 快照的 rows.window 只带尾部 snapshotTailWindowRows 行（协议常量，60）。单轮长回合里
++ * 尾 60 行全是工具输出，任何一次重订阅（帧断档 → forceSnapshot）的整替都会把窗口里
++ * 早前的提问整段冲掉（实测症状：长回合把之前的提问「挤走」、界面反复刷新）。
++ * 在**同 logEpoch 且追加性未破坏**时，把本地窗口里 [firstRowId, 新尾巴首行) 的行拼回
++ * 前面；其余任何情况整取新快照（原行为）。
++ *
++ * 追加性守卫（任一不满足即放弃拼接）：
++ * - 新 totalCount / 新末行 rowId 不得小于本地（rewind 迹象 → 整取）；
++ * - 拼回行数不得超过 totalCount - 新尾巴长度（快照声称的更早行数上限）。
++ *
++ * 输出是单个全新快照对象、由调用方一次 setState 原子落地——不涉及逐键合并，
++ * 与 store「绝不 merge」的状态机规则不冲突（那条规则针对任意状态键）。
++ */
++export function mergeSnapshotTailOntoLocalWindow(
++  prev: ConversationSnapshot | null,
++  next: ConversationSnapshot,
++): ConversationSnapshot {
++  if (prev === null || next.logEpoch !== prev.logEpoch) return next;
++  const nextWindow = next.rows.window;
++  const prevWindow = prev.rows.window;
++  const nextFirst = nextWindow[0];
++  const nextLast = nextWindow[nextWindow.length - 1];
++  const prevLast = prevWindow[prevWindow.length - 1];
++  if (nextFirst === undefined || nextLast === undefined || prevLast === undefined) return next;
++  if (next.rows.totalCount < prev.rows.totalCount) return next;
++  if (nextLast.rowId < prevLast.rowId) return next;
++  const firstRowId = next.rows.firstRowId ?? Number.NEGATIVE_INFINITY;
++  const kept = prevWindow.filter((row) => row.rowId < nextFirst.rowId && row.rowId >= firstRowId);
++  if (kept.length === 0) return next;
++  if (kept.length > next.rows.totalCount - nextWindow.length) return next;
++  return { ...next, rows: { ...next.rows, window: [...kept, ...nextWindow] } };
++}
+\ No newline at end of file
+diff --git a/packages/ui/test/conversationWindowBound.test.ts b/packages/ui/test/conversationWindowBound.test.ts
+new file mode 100644
+index 0000000..32229d4
+--- /dev/null
++++ b/packages/ui/test/conversationWindowBound.test.ts
+@@ -0,0 +1,123 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import type { ConversationRow, ConversationSnapshot } from "@zcode/shared/zcode-protocol-v4";
++import {
++  CONVERSATION_WINDOW_MAX_QUERY_TURNS,
++  boundWindowOnRealUserQuery,
++  isRealUserQueryRow,
++  mergeSnapshotTailOntoLocalWindow,
++} from "../src/v4/conversationWindowBound.js";
++
++function row(rowId: number, turnId: string, kind: string, origin?: string): ConversationRow {
++  return {
++    rowId,
++    turnId,
++    kind,
++    ...(origin === undefined ? {} : { origin }),
++    createdAt: 0,
++    createdAtSeq: rowId,
++  } as unknown as ConversationRow;
++}
++
++const query = (rowId: number, turnId: string): ConversationRow =>
++  row(rowId, turnId, "userInput", "realUser");
++const synthetic = (rowId: number, turnId: string): ConversationRow =>
++  row(rowId, turnId, "userInput", "goalContinuation");
++const tool = (rowId: number, turnId: string): ConversationRow => row(rowId, turnId, "toolCall");
++
++function snapshot(
++  rows: ConversationRow[],
++  totalCount: number,
++  firstRowId: number | null,
++  logEpoch = "e1",
++): ConversationSnapshot {
++  return {
++    logEpoch,
++    rows: { window: rows, totalCount, firstRowId },
++  } as unknown as ConversationSnapshot;
++}
++
++test("isRealUserQueryRow 只认 realUser 的 userInput", () => {
++  assert.equal(isRealUserQueryRow(query(1, "t1")), true);
++  assert.equal(isRealUserQueryRow(synthetic(2, "t1")), false);
++  assert.equal(isRealUserQueryRow(tool(3, "t1")), false);
++});
++
++test("真实提问不超过 N 时窗口恒等不变", () => {
++  const rows: ConversationRow[] = [];
++  for (let i = 0; i < CONVERSATION_WINDOW_MAX_QUERY_TURNS; i += 1) {
++    rows.push(query(i * 2 + 1, `t${i}`), tool(i * 2 + 2, `t${i}`));
++  }
++  assert.equal(boundWindowOnRealUserQuery(rows), rows);
++});
++
++test("第 N+1 个提问把窗口收敛到最近 N 个提问所在的回合", () => {
++  const rows: ConversationRow[] = [];
++  const turns = CONVERSATION_WINDOW_MAX_QUERY_TURNS + 1;
++  for (let i = 0; i < turns; i += 1) {
++    rows.push(query(i * 3 + 1, `t${i}`), tool(i * 3 + 2, `t${i}`), tool(i * 3 + 3, `t${i}`));
++  }
++  // 无真实提问的合成回合：收敛时一并出窗。
++  rows.push(synthetic(100, "t-synthetic"));
++  const bounded = boundWindowOnRealUserQuery(rows);
++  assert.notEqual(bounded, rows);
++  assert.equal(bounded.length, CONVERSATION_WINDOW_MAX_QUERY_TURNS * 3);
++  assert.equal(bounded[0]?.rowId, 4); // t1 的首行；t0 整回合已出窗
++  assert.equal(bounded.some((r) => r.turnId === "t0"), false);
++  assert.equal(bounded.some((r) => r.turnId === "t-synthetic"), false);
++  assert.equal(bounded.some((r) => r.turnId === `t${turns - 1}`), true);
++});
++
++test("合成行不计入提问数、不触发收敛", () => {
++  const rows: ConversationRow[] = [query(1, "t0"), query(2, "t1"), query(3, "t2")];
++  for (let i = 0; i < 30; i += 1) rows.push(synthetic(10 + i, `t-syn-${i}`));
++  assert.equal(boundWindowOnRealUserQuery(rows), rows);
++});
++
++test("merge：同 logEpoch 且追加性成立时把本地更早行拼回尾巴前", () => {
++  const prev = snapshot(
++    Array.from({ length: 10 }, (_, i) => tool(i + 1, `t${i}`)),
++    20,
++    1,
++  );
++  const next = snapshot(
++    Array.from({ length: 4 }, (_, i) => tool(i + 9, `t${i + 8}`)),
++    20,
++    1,
++  );
++  const merged = mergeSnapshotTailOntoLocalWindow(prev, next);
++  assert.notEqual(merged, next);
++  assert.equal(merged.rows.window.length, 12);
++  assert.equal(merged.rows.window[0]?.rowId, 1);
++  assert.equal(merged.rows.window[11]?.rowId, 12);
++  assert.equal(merged.rows.totalCount, 20);
++});
++
++test("merge：logEpoch 不同 / 无本地状态时整取新快照", () => {
++  const prev = snapshot([tool(1, "t0")], 10, 1, "e1");
++  const next = snapshot([tool(2, "t0")], 10, 1, "e2");
++  assert.equal(mergeSnapshotTailOntoLocalWindow(prev, next), next);
++  assert.equal(mergeSnapshotTailOntoLocalWindow(null, next), next);
++});
++
++test("merge：追加性被破坏（rewind 迹象）时放弃拼接", () => {
++  const prev = snapshot([tool(10, "t0"), tool(11, "t0")], 20, 1);
++  // totalCount 倒退
++  const rewoundTotal = snapshot([tool(12, "t0")], 19, 1);
++  assert.equal(mergeSnapshotTailOntoLocalWindow(prev, rewoundTotal), rewoundTotal);
++  // 末行 rowId 倒退
++  const rewoundTail = snapshot([tool(5, "t0")], 20, 1);
++  assert.equal(mergeSnapshotTailOntoLocalWindow(prev, rewoundTail), rewoundTail);
++});
++
++test("merge：拼回行数超过快照声称的更早行数上限时放弃拼接", () => {
++  // 本地窗口 15 行（rowId 1..15，total 15）；新尾巴 2 行（15..16）、total 15 不变
++  // （rewind 后 rowId 有空洞是合法的）⇒ 声称的更早行只有 15-2=13 行，本地可拼回 14 行 → 放弃。
++  const prev = snapshot(
++    Array.from({ length: 15 }, (_, i) => tool(i + 1, `t${i}`)),
++    15,
++    1,
++  );
++  const next = snapshot([tool(15, "t14"), tool(16, "t14")], 15, 1);
++  assert.equal(mergeSnapshotTailOntoLocalWindow(prev, next), next);
++});
+\ No newline at end of file
+-- 
+2.45.1.windows.1
+

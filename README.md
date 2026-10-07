@@ -1,6 +1,6 @@
 # zcode_performance_boost
 
-ZCode 性能优化 —— 超长对话「**界面卡顿** + **renderer 内存只涨不缩**」的**源码级修复**（补丁 + 投稿文案），基于官方开源仓库 [zai-org/ZCode](https://github.com/zai-org/ZCode)（Apache-2.0）。
+**一条 `git am`，修掉 ZCode 超长对话的三个渲染层 bug**：界面卡顿、renderer 内存只涨不缩、长回合把早前提问挤走。基于官方开源仓库 [zai-org/ZCode](https://github.com/zai-org/ZCode)（Apache-2.0）的源码级补丁——定位到根因、带单测、可直接应用。
 
 > 非官方项目，与 Z.ai / ZCode 无隶属关系。仅供学习研究，按现状提供。
 
